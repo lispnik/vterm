@@ -27,4 +27,4 @@ test:
 	  --eval '(asdf:test-system "vterm")'
 
 clean:
-	rm -rf ~/.cache/common-lisp/*/home/*/vterm 2>/dev/null || true
+	rm -rf ~/.cache/common-lisp/*$(CURDIR)

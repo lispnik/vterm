@@ -26,7 +26,9 @@
   "Load libvterm, adding Homebrew's lib dir to the search path first (Apple
 Silicon installs it under /opt/homebrew/lib, which is not always on the default
 dyld search path)."
-  (dolist (d '(#p"/opt/homebrew/lib/" #p"/usr/local/lib/" #p"/usr/lib/"))
+  ;; Pushed in reverse so they're searched in the order listed: a native
+  ;; Homebrew build wins over a stale Intel one left in /usr/local.
+  (dolist (d (reverse '(#p"/opt/homebrew/lib/" #p"/usr/local/lib/" #p"/usr/lib/")))
     (pushnew d cffi:*foreign-library-directories* :test #'equal))
   (unless (cffi:foreign-library-loaded-p 'libvterm)
     (cffi:use-foreign-library libvterm)))

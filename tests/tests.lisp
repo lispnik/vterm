@@ -105,7 +105,7 @@
     (vterm-keyboard-end-paste vt)
     (check t "no crash")))
 
-(deftest resize
+(deftest resize-preserves-contents
   (with-vterm (vt screen :rows 10 :cols 20)
     (feed vt "resize")
     (vterm-set-size vt 30 100)
