@@ -1,0 +1,68 @@
+name: CI
+
+# Hermetic: restore the pinned dependencies from ocicl.csv and inherit nothing
+# (no ~/.sbclrc, no site init, a source registry of this tree alone), so a
+# missing lock-file entry fails here rather than on someone else's machine.
+# Runs on Linux and macOS because the hand-laid-out struct ABI and the
+# by-value VTermPos packing are what this library is mostly made of.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: test · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install SBCL and libvterm
+        run: |
+          set -eux
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install sbcl libvterm
+          else
+            sudo apt-get update
+            sudo apt-get install -y sbcl libvterm-dev
+          fi
+
+      - name: Cache ocicl binary (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/bin/ocicl
+          key: Linux-ocicl-bin-v1
+
+      - name: Install ocicl
+        run: |
+          set -eux
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            brew install ocicl
+          elif [ ! -x "$HOME/.local/bin/ocicl" ]; then
+            git clone --depth 1 https://github.com/ocicl/ocicl.git "$HOME/ocicl-src"
+            ( cd "$HOME/ocicl-src" && sbcl --non-interactive --load setup.lisp )
+          fi
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Restore dependencies
+        # ocicl exits 0 when a download fails, so check the log.
+        run: |
+          ocicl setup
+          for attempt in 1 2 3; do
+            ocicl install 2>&1 | tee ocicl-install.log
+            grep -q "failed to install" ocicl-install.log || break
+            sleep 20
+          done
+          ! grep -q "failed to install" ocicl-install.log
+
+      - name: Run the suite
+        run: make test
