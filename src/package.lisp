@@ -11,6 +11,8 @@
    ;; the shared library
    #:libvterm
    #:ensure-libvterm
+   ;; errors
+   #:vterm-error #:vterm-error-message
    ;; foreign types and their slot names
    #:vterm-pos #:vterm-pos-row #:vterm-pos-col  ; slots ROW/COL stay internal
    #:vterm-rect #:vterm-rect-start-row #:vterm-rect-end-row
@@ -102,7 +104,7 @@
    #:vterm-state-set-bold-highbright #:vterm-state-convert-color-to-rgb
    #:vterm-state-get-penattr #:vterm-state-set-termprop
    #:vterm-state-focus-in #:vterm-state-focus-out
-   #:vterm-state-get-lineinfo
+   #:vterm-get-lineinfo
    #:vterm-state-set-selection-callbacks #:vterm-state-send-selection
    #:vterm-color-is-equal #:vterm-get-prop-type #:vterm-get-attr-type
    ;; by-value VTermPos / VTermRect packing

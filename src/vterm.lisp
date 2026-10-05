@@ -15,6 +15,33 @@
 
 (in-package #:vterm)
 
+;;; --- platform guard ---------------------------------------------------------
+;;;
+;;; The hot paths pass VTermPos / VTermRect / VTermStringFragment *by value* as
+;;; packed :uint64 words (PACK-POS, PACK-RECT).  That is only ABI-correct where
+;;; small all-integer structs travel in general registers exactly like integers:
+;;; 64-bit little-endian System V (x86-64) and AAPCS64 (arm64) -- Linux, macOS,
+;;; the BSDs.  Win64 passes 16-byte structs by reference, and big-endian or
+;;; 32-bit ABIs lay the words out differently, so refuse to build there rather
+;;; than read garbage at runtime.  (Features come from trivial-features, which
+;;; cffi loads.)
+
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  #-(and (or x86-64 arm64) little-endian (not windows))
+  (error "vterm: the by-value struct packing this binding relies on is only ~
+          correct on 64-bit little-endian x86-64/arm64 outside Windows."))
+
+;;; --- errors -----------------------------------------------------------------
+
+(define-condition vterm-error (error)
+  ((message :initarg :message :reader vterm-error-message))
+  (:report (lambda (c s) (write-string (vterm-error-message c) s)))
+  (:documentation "Signalled for a bad argument or an unusable libvterm, in
+place of the crash the C library would produce."))
+
+(defun vterm-error (control &rest args)
+  (error 'vterm-error :message (apply #'format nil control args)))
+
 ;;; --- the shared library -----------------------------------------------------
 
 (cffi:define-foreign-library libvterm
@@ -31,7 +58,17 @@ dyld search path)."
   (dolist (d (reverse '(#p"/opt/homebrew/lib/" #p"/usr/local/lib/" #p"/usr/lib/")))
     (pushnew d cffi:*foreign-library-directories* :test #'equal))
   (unless (cffi:foreign-library-loaded-p 'libvterm)
-    (cffi:use-foreign-library libvterm)))
+    (cffi:use-foreign-library libvterm)
+    ;; The struct layouts here are libvterm 0.3's: 0.1 had a different
+    ;; VTermColor, 0.2 lacks sb_clear and the newer attribute bits, so an older
+    ;; library would corrupt memory silently.  vterm_check_version can't be used
+    ;; to detect that -- it abort()s the process -- so probe for a 0.3-only
+    ;; symbol instead.
+    (unless (cffi:foreign-symbol-pointer "vterm_screen_enable_reflow")
+      (cffi:close-foreign-library 'libvterm)
+      (vterm-error "vterm: the loaded libvterm is older than 0.3, whose struct ~
+                    layouts this binding requires; install libvterm >= 0.3.")))
+  t)
 
 ;;; --- foreign types ----------------------------------------------------------
 
@@ -181,8 +218,7 @@ VSF-LEN / VSF-INITIAL-P / VSF-FINAL-P)."
 (defconstant +underline-double+ 2)
 (defconstant +underline-curly+  3)
 
-;;; VTermLineInfo: a bitfield in one unsigned int, returned by pointer from
-;;; vterm_state_get_lineinfo.  Read it with (cffi:mem-ref p :uint32).
+;;; VTermLineInfo: a bitfield in one unsigned int; VTERM-GET-LINEINFO reads it.
 (declaim (inline lineinfo-doublewidth-p lineinfo-doubleheight lineinfo-continuation-p))
 (defun lineinfo-doublewidth-p  (word) (logbitp 0 word))
 (defun lineinfo-doubleheight   (word) "0 none, 1 top, 2 bottom." (ldb (byte 2 1) word))
@@ -293,8 +329,22 @@ VSF-LEN / VSF-INITIAL-P / VSF-FINAL-P)."
 
 ;;; --- functions --------------------------------------------------------------
 
-(cffi:defcfun ("vterm_new" vterm-new) :pointer
+(cffi:defcfun ("vterm_new" %vterm-new) :pointer
   (rows :int) (cols :int))
+
+(defun %check-size (who rows cols)
+  (unless (and (typep rows '(integer 1 #.(1- (ash 1 31))))
+               (typep cols '(integer 1 #.(1- (ash 1 31)))))
+    (vterm-error "~A: size ~S x ~S must be positive integers" who rows cols)))
+
+(defun vterm-new (rows cols)
+  "A new VTerm of ROWS x COLS (both positive; libvterm accepts a negative size
+and then crashes on the first write).  Free it with VTERM-FREE."
+  (%check-size 'vterm-new rows cols)
+  (let ((vt (%vterm-new rows cols)))
+    (when (cffi:null-pointer-p vt)
+      (vterm-error "vterm-new: libvterm could not allocate a ~D x ~D terminal" rows cols))
+    vt))
 
 (cffi:defcfun ("vterm_free" vterm-free) :void
   (vt :pointer))
@@ -302,13 +352,21 @@ VSF-LEN / VSF-INITIAL-P / VSF-FINAL-P)."
 (cffi:defcfun ("vterm_set_utf8" vterm-set-utf8) :void
   (vt :pointer) (is-utf8 :int))
 
-(cffi:defcfun ("vterm_set_size" vterm-set-size) :void
+(cffi:defcfun ("vterm_set_size" %vterm-set-size) :void
   (vt :pointer) (rows :int) (cols :int))
+
+(defun vterm-set-size (vt rows cols)
+  "Resize VT to ROWS x COLS (both positive)."
+  (%check-size 'vterm-set-size rows cols)
+  (%vterm-set-size vt rows cols))
 
 (cffi:defcfun ("vterm_input_write" vterm-input-write) :unsigned-long
   (vt :pointer) (bytes :pointer) (len :unsigned-long))
 
 (cffi:defcfun ("vterm_output_set_callback" vterm-output-set-callback) :void
+  "Route VT's output bytes to the C function FUNC(const char *s, size_t len,
+void *user) instead of the internal buffer.  FUNC must stay callable for as long
+as VT can produce output (until it is replaced or VT is freed)."
   (vt :pointer) (func :pointer) (user :pointer))
 
 (cffi:defcfun ("vterm_keyboard_unichar" vterm-keyboard-unichar) :void
@@ -324,6 +382,10 @@ VSF-LEN / VSF-INITIAL-P / VSF-FINAL-P)."
   (vt :pointer))
 
 (cffi:defcfun ("vterm_screen_set_callbacks" vterm-screen-set-callbacks) :void
+  "Install the VTermScreenCallbacks at CALLBACKS.  libvterm keeps the *pointer*,
+not a copy: allocate the struct with cffi:foreign-alloc (never
+with-foreign-object) and keep it, and every function pointer in it, alive until
+the callbacks are replaced or the VTerm is freed."
   (screen :pointer) (callbacks :pointer) (user :pointer))
 
 (cffi:defcfun ("vterm_screen_reset" vterm-screen-reset) :void
@@ -380,6 +442,10 @@ VSF-LEN / VSF-INITIAL-P / VSF-FINAL-P)."
   (query :pointer))
 
 (cffi:defcfun ("vterm_state_set_selection_callbacks" vterm-state-set-selection-callbacks) :void
+  "Install the VTermSelectionCallbacks at CALLBACKS, with BUFFER (BUFLEN bytes)
+as the base64 scratch buffer; a null BUFFER makes libvterm allocate one.  As
+with VTERM-SCREEN-SET-CALLBACKS, libvterm keeps the CALLBACKS and BUFFER
+pointers: foreign-alloc them and keep them alive until the VTerm is freed."
   (state :pointer) (callbacks :pointer) (user :pointer)
   (buffer :pointer) (buflen :unsigned-long))
 
@@ -395,7 +461,11 @@ VSF-LEN / VSF-INITIAL-P / VSF-FINAL-P)."
 (declaim (inline vterm-screen-get-cell))
 (defun vterm-screen-get-cell (screen row col cell)
   "Read the emulated cell at (ROW,COL) into the foreign CELL (a
-VTermScreenCell*).  Returns non-zero if the position is valid."
+VTermScreenCell*).  Returns non-zero if the position is valid; for an
+out-of-range position it returns 0 and leaves CELL untouched (still holding
+whatever was read last), so check the result.  Unlike the other screen
+queries this one is bounds-checked by libvterm itself, so it takes the screen
+and stays unchecked here -- it is the per-cell hot path."
   (cffi:foreign-funcall "vterm_screen_get_cell"
                         :pointer screen
                         :uint64 (pack-pos row col)
@@ -480,11 +550,27 @@ prints a message and calls abort(), killing the whole process."
 (cffi:defcfun ("vterm_state_get_default_colors" vterm-state-get-default-colors) :void
   (state :pointer) (default-fg :pointer) (default-bg :pointer))
 
-(cffi:defcfun ("vterm_state_get_palette_color" vterm-state-get-palette-color) :void
+(cffi:defcfun ("vterm_state_get_palette_color" %vterm-state-get-palette-color) :void
   (state :pointer) (index :int) (col :pointer))
 
-(cffi:defcfun ("vterm_state_set_palette_color" vterm-state-set-palette-color) :void
+(cffi:defcfun ("vterm_state_set_palette_color" %vterm-state-set-palette-color) :void
   (state :pointer) (index :int) (col :pointer))
+
+;; libvterm silently ignores an index outside 0-255: a get leaves COL holding
+;; whatever was there (uninitialised memory, typically), a set does nothing.
+(defun %check-palette-index (who index)
+  (unless (typep index '(integer 0 255))
+    (vterm-error "~A: palette index ~S is outside 0-255" who index)))
+
+(defun vterm-state-get-palette-color (state index col)
+  "Read palette entry INDEX (0-255) into the VTermColor at COL."
+  (%check-palette-index 'vterm-state-get-palette-color index)
+  (%vterm-state-get-palette-color state index col))
+
+(defun vterm-state-set-palette-color (state index col)
+  "Set palette entry INDEX (0-255) from the VTermColor at COL."
+  (%check-palette-index 'vterm-state-set-palette-color index)
+  (%vterm-state-set-palette-color state index col))
 
 (cffi:defcfun ("vterm_state_set_bold_highbright" vterm-state-set-bold-highbright) :void
   (state :pointer) (bold-is-highbright :int))
@@ -507,8 +593,7 @@ prints a message and calls abort(), killing the whole process."
   "Report focus lost (emits CSI O if the program enabled focus reporting)."
   (state :pointer))
 
-(cffi:defcfun ("vterm_state_get_lineinfo" vterm-state-get-lineinfo) :pointer
-  "Pointer to ROW's VTermLineInfo; decode (cffi:mem-ref p :uint32) with LINEINFO-*."
+(cffi:defcfun ("vterm_state_get_lineinfo" %vterm-state-get-lineinfo) :pointer
   (state :pointer) (row :int))
 
 (defun vterm-state-send-selection (state mask string)
@@ -527,46 +612,79 @@ The VTermStringFragment goes by value as its two words (pointer, packed bits)."
 
 ;;; --- screen -----------------------------------------------------------------
 
-(defun vterm-screen-get-text (screen start-row end-row start-col end-col)
-  "The text in the half-open rectangle as a Lisp string, rows joined by
-newlines (libvterm trims each row's trailing blanks)."
-  (let ((len (* 4 6 (max 1 (- end-row start-row)) (max 1 (- end-col start-col)))))
+;;; libvterm does not bounds-check these: a position or rectangle outside the
+;;; screen dereferences a NULL cell and kills the process.  A VTermScreen has no
+;;; size accessor, so they take the VTerm, check against VTERM-GET-SIZE, and
+;;; signal VTERM-ERROR instead.
+
+(defun %check-pos (who vt row col)
+  (multiple-value-bind (rows cols) (vterm-get-size vt)
+    (unless (and (typep row 'integer) (< -1 row rows) (typep col 'integer) (< -1 col cols))
+      (vterm-error "~A: position (~S, ~S) is outside the ~D x ~D screen"
+                   who row col rows cols))))
+
+(defun %check-rect (who vt start-row end-row start-col end-col)
+  (multiple-value-bind (rows cols) (vterm-get-size vt)
+    (unless (and (every #'integerp (list start-row end-row start-col end-col))
+                 (<= 0 start-row end-row rows) (<= 0 start-col end-col cols))
+      (vterm-error "~A: rectangle rows [~S,~S) cols [~S,~S) is not within the ~D x ~D screen"
+                   who start-row end-row start-col end-col rows cols))))
+
+(defun vterm-get-lineinfo (vt row)
+  "ROW's VTermLineInfo word, for the LINEINFO-* decoders."
+  (%check-pos 'vterm-get-lineinfo vt row 0)
+  (cffi:mem-ref (%vterm-state-get-lineinfo (vterm-obtain-state vt) row) :uint32))
+
+(defun vterm-screen-get-text (vt start-row end-row start-col end-col)
+  "The text of VT's screen in the half-open rectangle, as a Lisp string with
+rows joined by newlines (libvterm trims each row's trailing blanks)."
+  (%check-rect 'vterm-screen-get-text vt start-row end-row start-col end-col)
+  (let* ((nrows (- end-row start-row))
+         ;; a cell is at most 6 code points of at most 4 UTF-8 bytes, plus one
+         ;; newline per row
+         (len (max 1 (* nrows (1+ (* 4 6 (- end-col start-col)))))))
     (cffi:with-foreign-object (buf :char len)
       (multiple-value-bind (rows cols) (pack-rect start-row end-row start-col end-col)
         (let ((n (cffi:foreign-funcall "vterm_screen_get_text"
-                                       :pointer screen :pointer buf :unsigned-long len
+                                       :pointer (vterm-obtain-screen vt)
+                                       :pointer buf :unsigned-long len
                                        :uint64 rows :uint64 cols
                                        :unsigned-long)))
-          (cffi:foreign-string-to-lisp buf :count (min n len) :encoding :utf-8))))))
+          (values (cffi:foreign-string-to-lisp buf :count (min n len) :encoding :utf-8)))))))
 
-(defun vterm-screen-get-chars (screen start-row end-row start-col end-col)
-  "The code points in the half-open rectangle as a vector of integers."
-  (let ((len (* 6 (max 1 (- end-row start-row)) (max 1 (- end-col start-col)))))
+(defun vterm-screen-get-chars (vt start-row end-row start-col end-col)
+  "The code points of VT's screen in the half-open rectangle, as a vector of
+integers (rows separated by 10, a newline)."
+  (%check-rect 'vterm-screen-get-chars vt start-row end-row start-col end-col)
+  (let ((len (max 1 (* (- end-row start-row) (1+ (* 6 (- end-col start-col)))))))
     (cffi:with-foreign-object (buf :uint32 len)
       (multiple-value-bind (rows cols) (pack-rect start-row end-row start-col end-col)
         (let* ((n (min len (cffi:foreign-funcall "vterm_screen_get_chars"
-                                                 :pointer screen :pointer buf :unsigned-long len
+                                                 :pointer (vterm-obtain-screen vt)
+                                                 :pointer buf :unsigned-long len
                                                  :uint64 rows :uint64 cols
                                                  :unsigned-long)))
                (out (make-array n)))
           (dotimes (i n out) (setf (aref out i) (cffi:mem-aref buf :uint32 i))))))))
 
-(declaim (inline vterm-screen-is-eol))
-(defun vterm-screen-is-eol (screen row col)
-  "True if (ROW,COL) is at or past the last printed cell of its row."
+(defun vterm-screen-is-eol (vt row col)
+  "True if (ROW,COL) of VT's screen is at or past the last printed cell of its row."
+  (%check-pos 'vterm-screen-is-eol vt row col)
   (/= 0 (cffi:foreign-funcall "vterm_screen_is_eol"
-                              :pointer screen :uint64 (pack-pos row col) :int)))
+                              :pointer (vterm-obtain-screen vt)
+                              :uint64 (pack-pos row col) :int)))
 
-(defun vterm-screen-get-attrs-extent (screen row col &optional (mask +all-attrs-mask+))
-  "The run of cells on ROW around COL sharing its attributes (those in MASK,
-+ATTR-*-MASK+).  Returns the half-open (values START-ROW END-ROW START-COL
-END-COL), or NIL if none."
+(defun vterm-screen-get-attrs-extent (vt row col &optional (mask +all-attrs-mask+))
+  "The run of cells on ROW of VT's screen around COL sharing its attributes
+(those in MASK, +ATTR-*-MASK+).  Returns the half-open (values START-ROW END-ROW
+START-COL END-COL), or NIL if none."
+  (%check-pos 'vterm-screen-get-attrs-extent vt row col)
   (cffi:with-foreign-object (r '(:struct vterm-rect))
     ;; libvterm searches within the columns it is given; -1 means the whole row
     (setf (vterm-rect-start-row r) row (vterm-rect-end-row r) (1+ row)
           (vterm-rect-start-col r) -1 (vterm-rect-end-col r) -1)
     (when (/= 0 (cffi:foreign-funcall "vterm_screen_get_attrs_extent"
-                                      :pointer screen :pointer r
+                                      :pointer (vterm-obtain-screen vt) :pointer r
                                       :uint64 (pack-pos row col) :int mask :int))
       ;; libvterm leaves end_col inclusive here, unlike every other VTermRect
       (values (vterm-rect-start-row r) (vterm-rect-end-row r)

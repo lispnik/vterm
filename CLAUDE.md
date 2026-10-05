@@ -30,3 +30,10 @@ make build   # load check
   stay internal (they clash with `revision:row`) — the `vterm-pos-row`/`-col` accessors are exported
   instead. Slot names that are CL symbols (`type`, `set`) need no export.
 - `chars[0] == 0xFFFFFFFF` marks the right half of a double-width glyph.
+- **Never pass an unchecked position or rect to libvterm.** Most `vterm_screen_*` queries and
+  `vterm_state_get_lineinfo` don't bounds-check and segfault on bad input. Wrap them in a Lisp
+  function that takes the `VTerm` and calls `%check-pos` / `%check-rect` (or `%check-size`,
+  `%check-palette-index`), signalling `vterm-error`. `vterm_screen_get_cell` is the one exception
+  (libvterm checks it; it's the hot path). Add a `signals-vterm-error` regression test for each.
+- `vterm_check_version` **aborts the process** on a mismatch — never call it implicitly.
+  `ensure-libvterm` probes for a 0.3-only symbol instead.

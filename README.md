@@ -44,13 +44,14 @@ window for the [`revision`](https://github.com/lispnik/revision) TUI framework.
   `vterm-screen-convert-color-to-rgb`, `vterm-screen-set-damage-merge`,
   `vterm-screen-flush-damage`, `vterm-screen-get-cell`,
   `vterm-screen-get-text`, `vterm-screen-get-chars`, `vterm-screen-is-eol`,
-  `vterm-screen-get-attrs-extent`.
+  `vterm-screen-get-attrs-extent` (these four take the `VTerm`, not the screen
+  — see *Safety* below).
 - **State:** `vterm-obtain-state`, `vterm-state-reset`,
   `vterm-state-get-cursorpos`, default and palette colours
   (`vterm-state-{get,set}-default-colors`, `vterm-state-{get,set}-palette-color`,
   `vterm-state-set-bold-highbright`, `vterm-state-convert-color-to-rgb`),
   `vterm-state-get-penattr`, `vterm-state-set-termprop`,
-  `vterm-state-focus-in` / `-out`, `vterm-state-get-lineinfo`, and OSC 52
+  `vterm-state-focus-in` / `-out`, `vterm-get-lineinfo`, and OSC 52
   (`vterm-state-set-selection-callbacks`, `vterm-state-send-selection`).
 - **Structs:** `vterm-pos`, `vterm-rect`, `vterm-color`, `vterm-screen-cell`,
   `vterm-screen-callbacks`, `vterm-string-fragment`, `vterm-value` (union),
@@ -90,6 +91,30 @@ are C bitfields; both are read as one `:uint32` and unpacked by hand (bold =
 bit 0, underline = bits 1–2, italic = 3, blink = 4, reverse = 5, conceal = 6,
 strike = 7; `vsf-len` / `vsf-initial-p` / `vsf-final-p`). The right half of a
 double-width glyph reads `chars[0] = 0xFFFFFFFF` — don't `code-char` it.
+
+## Safety
+
+libvterm trusts its caller: an out-of-range position or rectangle passed to
+`get_text`, `get_chars`, `is_eol`, `get_attrs_extent` or `get_lineinfo`
+dereferences a NULL cell and kills the process, and `vterm_new` happily makes a
+terminal of negative size that crashes on its first write. The binding checks
+these in Lisp and signals a `vterm:vterm-error` instead — which is why those
+screen queries take the `VTerm` (a `VTermScreen` has no size accessor). Palette
+indices outside 0–255 are rejected too, rather than silently ignored.
+
+Two things it can't check for you:
+
+- **Callback lifetimes.** `vterm-screen-set-callbacks`,
+  `vterm-state-set-selection-callbacks` and `vterm-output-set-callback` store
+  your *pointers*, not copies. Allocate callback structs and buffers with
+  `cffi:foreign-alloc` and keep them (and the C function pointers in them)
+  alive until the `VTerm` is freed.
+- **Threads.** libvterm has no locking; drive each `VTerm` from one thread.
+
+`ensure-libvterm` refuses a libvterm older than 0.3 (whose struct layouts
+differ), and the system refuses to build on platforms where the by-value
+struct packing isn't ABI-correct (anything but 64-bit little-endian
+x86-64/arm64 outside Windows).
 
 ## Requirements
 

@@ -126,13 +126,13 @@
 (deftest text-extraction
   (with-vterm (vt screen :rows 5 :cols 20)
     (feed vt (format nil "ab~C[1mCD~C[0mef~C~Cxy" #\Esc #\Esc #\Return #\Newline))
-    (check (string= (vterm-screen-get-text screen 0 2 0 20) (format nil "abCDef~%xy"))
+    (check (string= (vterm-screen-get-text vt 0 2 0 20) (format nil "abCDef~%xy"))
            "get-text joins rows with newlines")
-    (check (equalp (vterm-screen-get-chars screen 0 1 0 4) #(97 98 67 68)) "get-chars")
-    (check (equal (multiple-value-list (vterm-screen-get-attrs-extent screen 0 2))
+    (check (equalp (vterm-screen-get-chars vt 0 1 0 4) #(97 98 67 68)) "get-chars")
+    (check (equal (multiple-value-list (vterm-screen-get-attrs-extent vt 0 2))
                   '(0 1 2 4))
            "bold run CD is cols [2,4)")
-    (check (and (not (vterm-screen-is-eol screen 0 5)) (vterm-screen-is-eol screen 0 6))
+    (check (and (not (vterm-screen-is-eol vt 0 5)) (vterm-screen-is-eol vt 0 6))
            "eol after the last printed cell")))
 
 (deftest size-and-utf8-queries
@@ -219,8 +219,7 @@
   (with-vterm (vt screen :rows 3 :cols 5)
     (vterm-screen-enable-reflow screen 1)
     (feed vt "abcdefgh")
-    (flet ((cont (r) (lineinfo-continuation-p
-                      (cffi:mem-ref (vterm-state-get-lineinfo (vterm-obtain-state vt) r) :uint32))))
+    (flet ((cont (r) (lineinfo-continuation-p (vterm-get-lineinfo vt r))))
       (check (and (not (cont 0)) (cont 1)) "row 1 soft-wraps from row 0"))))
 
 (deftest rect-and-pos-packing
@@ -236,6 +235,68 @@
 (deftest library-version
   (vterm-check-version 0 3)             ; aborts the process on a mismatch
   (check t "libvterm is 0.3-compatible"))
+
+;;; --- robustness: bad arguments signal VTERM-ERROR instead of crashing -------
+;;;
+;;; Each of these crashed the process (SIGSEGV inside libvterm) or read
+;;; uninitialised memory before the checks.  If a check regresses, SBCL turns
+;;; the segfault into a MEMORY-FAULT-ERROR, which is not a VTERM-ERROR, so the
+;;; test still fails (rather than passing by accident).
+
+(defmacro signals-vterm-error (form description)
+  `(check (handler-case (progn ,form nil) (vterm-error () t))
+          (format nil "~A signals VTERM-ERROR" ,description)))
+
+(deftest out-of-range-screen-queries
+  (with-vterm (vt screen :rows 5 :cols 10)
+    (signals-vterm-error (vterm-screen-get-attrs-extent vt 99 0) "attrs-extent, row 99")
+    (signals-vterm-error (vterm-screen-get-attrs-extent vt 0 99) "attrs-extent, col 99")
+    (signals-vterm-error (vterm-screen-is-eol vt 99 0) "is-eol, row 99")
+    (signals-vterm-error (vterm-screen-is-eol vt 0 -5) "is-eol, col -5")
+    (signals-vterm-error (vterm-screen-get-text vt 0 99 0 10) "get-text, rows to 99")
+    (signals-vterm-error (vterm-screen-get-text vt 3 1 0 10) "get-text, inverted rows")
+    (signals-vterm-error (vterm-screen-get-chars vt 0 5 0 99) "get-chars, cols to 99")
+    (signals-vterm-error (vterm-get-lineinfo vt 100000) "lineinfo, row 100000")
+    (signals-vterm-error (vterm-get-lineinfo vt -1) "lineinfo, row -1")
+    ;; the edges themselves are fine
+    (check (string= (vterm-screen-get-text vt 0 5 0 10) (format nil "~%~%~%~%")) "full blank screen")
+    (check (string= (vterm-screen-get-text vt 2 2 0 10) "") "empty rect")
+    (check (vterm-screen-is-eol vt 4 9) "last cell")))
+
+(deftest bad-sizes
+  (ensure-libvterm)
+  (signals-vterm-error (vterm-new -1 5) "vterm-new -1 x 5")
+  (signals-vterm-error (vterm-new 0 0) "vterm-new 0 x 0")
+  (signals-vterm-error (vterm-new 2.5 5) "vterm-new non-integer")
+  (with-vterm (vt screen)
+    (signals-vterm-error (vterm-set-size vt -3 -3) "set-size -3 x -3")
+    (check (equal (multiple-value-list (vterm-get-size vt)) '(24 80)) "size unchanged")))
+
+(deftest bad-palette-index
+  (with-vterm (vt screen)
+    (let ((state (vterm-obtain-state vt)))
+      (cffi:with-foreign-object (c '(:struct vterm-color))
+        (set-color-rgb c 1 2 3)
+        (signals-vterm-error (vterm-state-get-palette-color state 999 c) "get index 999")
+        (signals-vterm-error (vterm-state-get-palette-color state -1 c) "get index -1")
+        (signals-vterm-error (vterm-state-set-palette-color state 256 c) "set index 256")
+        (vterm-state-get-palette-color state 255 c)
+        (check (color-rgb-p c) "index 255 is valid")))))
+
+(deftest get-text-dense-grid
+  ;; Every cell at libvterm's maximum: a 4-byte base char plus five 4-byte
+  ;; combining marks = 24 UTF-8 bytes.  Sizing the buffer at 24 bytes a cell
+  ;; leaves no room for the newlines between rows, which silently truncated
+  ;; the text (290 bytes needed, 288 available here).
+  (with-vterm (vt screen :rows 3 :cols 4)
+    (let* ((cell (format nil "~C~{~C~}" (code-char #x10000)
+                         (make-list 5 :initial-element (code-char #x1D167))))
+           (row (format nil "~{~A~}" (make-list 4 :initial-element cell))))
+      (feed vt (format nil "~A~C~C~A~C~C~A" row #\Return #\Newline row #\Return #\Newline row))
+      (check (string= (vterm-screen-get-text vt 0 3 0 4) (format nil "~A~%~A~%~A" row row row))
+             "no truncation")
+      (check (= 1 (length (multiple-value-list (vterm-screen-get-text vt 0 1 0 4))))
+             "one return value"))))
 
 ;;; --- runner -----------------------------------------------------------------
 
