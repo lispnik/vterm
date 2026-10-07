@@ -23,7 +23,7 @@ jobs:
         os: [ubuntu-latest, macos-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install SBCL and libvterm
         run: |
@@ -37,7 +37,7 @@ jobs:
 
       - name: Cache ocicl binary (Linux)
         if: runner.os == 'Linux'
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/.local/bin/ocicl
           key: Linux-ocicl-bin-v1
